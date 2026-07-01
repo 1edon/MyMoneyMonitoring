@@ -32,74 +32,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ФОРМАТИРОВАНИЯ ВАЛЮТЫ
+# ФУНКЦИИ ДЛЯ ФОРМАТИРОВАНИЯ ВАЛЮТЫ (РУССКИЙ ФОРМАТ)
 # =====================================================================
 def format_currency(amount: float) -> str:
     """
-    Форматирует число в валютный формат с разделителем тысяч - точка
+    Форматирует число в валютный формат с разделителем тысяч - точка,
+    разделитель копеек - запятая
     Пример: 5000 -> 5.000 ₽
+            10000.50 -> 10.000,50 ₽
+            15000.99 -> 15.000,99 ₽
     """
-    # Округляем до 2 знаков после запятой
+    # Округляем до 2 знаков
     amount = round(amount, 2)
     
-    # Разделяем целую и дробную части
+    # Если число целое (нет копеек)
     if amount == int(amount):
-        # Если число целое, показываем без копеек
         integer_part = str(int(amount))
-        formatted = f"{integer_part} ₽"
+        # Форматируем с разделителями тысяч
+        formatted = ''
+        for i, char in enumerate(reversed(integer_part)):
+            if i > 0 and i % 3 == 0:
+                formatted = '.' + formatted
+            formatted = char + formatted
+        return f"{formatted} ₽"
     else:
         # Если есть копейки
         integer_part = str(int(amount))
+        # Округляем копейки правильно
         decimal_part = str(int(round((amount - int(amount)) * 100))).zfill(2)
-        formatted = f"{integer_part}.{decimal_part} ₽"
-    
-    # Добавляем разделитель тысяч (точка)
-    parts = formatted.split('.')
-    if len(parts) == 2:
-        # Есть десятичная часть
-        integer_part = parts[0]
-        decimal_part = parts[1]
-        # Форматируем целую часть с разделителями
-        integer_formatted = ''
+        # Форматируем целую часть с разделителями тысяч
+        formatted_int = ''
         for i, char in enumerate(reversed(integer_part)):
             if i > 0 and i % 3 == 0:
-                integer_formatted = '.' + integer_formatted
-            integer_formatted = char + integer_formatted
-        return f"{integer_formatted}.{decimal_part} ₽"
-    else:
-        # Нет десятичной части
-        integer_part = parts[0]
-        integer_formatted = ''
-        for i, char in enumerate(reversed(integer_part)):
-            if i > 0 and i % 3 == 0:
-                integer_formatted = '.' + integer_formatted
-            integer_formatted = char + integer_formatted
-        return f"{integer_formatted} ₽"
-
-def format_currency_without_symbol(amount: float) -> str:
-    """
-    Форматирует число с разделителем тысяч - точка, без символа ₽
-    Пример: 5000 -> 5.000
-    """
-    amount = round(amount, 2)
-    
-    if amount == int(amount):
-        integer_part = str(int(amount))
-        integer_formatted = ''
-        for i, char in enumerate(reversed(integer_part)):
-            if i > 0 and i % 3 == 0:
-                integer_formatted = '.' + integer_formatted
-            integer_formatted = char + integer_formatted
-        return integer_formatted
-    else:
-        integer_part = str(int(amount))
-        decimal_part = str(int(round((amount - int(amount)) * 100))).zfill(2)
-        integer_formatted = ''
-        for i, char in enumerate(reversed(integer_part)):
-            if i > 0 and i % 3 == 0:
-                integer_formatted = '.' + integer_formatted
-            integer_formatted = char + integer_formatted
-        return f"{integer_formatted}.{decimal_part}"
+                formatted_int = '.' + formatted_int
+            formatted_int = char + formatted_int
+        # Используем запятую для копеек
+        return f"{formatted_int},{decimal_part} ₽"
 
 # =====================================================================
 # ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ
