@@ -20,7 +20,15 @@ from aiogram.types import (
     Message,
 )
 
-from sqlalchemy import BigInteger, Float, ForeignKey, String, func, select
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Float,
+    ForeignKey,
+    String,
+    func,
+    select,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -68,7 +76,6 @@ DEFAULT_EXPENSE_CATEGORIES = [
     "Прочее",
 ]
 
-# Список таймзон для быстрого выбора в настройках
 TZ_CHOICES = [
     "Europe/Kaliningrad",
     "Europe/Moscow",
@@ -87,6 +94,9 @@ TZ_CHOICES = [
     "UTC",
 ]
 
+MAX_CATEGORIES = 30  # защита от бесконечного добавления
+
+
 # --------------------------------------------------------------------------- #
 # Модели БД
 # --------------------------------------------------------------------------- #
@@ -100,14 +110,17 @@ class User(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # telegram id
     timezone: Mapped[str] = mapped_column(String(64), default=DEFAULT_TZ)
     last_bot_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    created_at: Mapped[datetime] = mapped_column(
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
 
 class IncomeCategory(Base):
     __tablename__ = "income_categories"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(64), unique=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
 
     records: Mapped[list["IncomeRecord"]] = relationship(back_populates="category")
 
@@ -116,7 +129,8 @@ class ExpenseCategory(Base):
     __tablename__ = "expense_categories"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(64), unique=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
 
     records: Mapped[list["ExpenseRecord"]] = relationship(back_populates="category")
 
@@ -131,7 +145,7 @@ class IncomeRecord(Base):
     comment: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
-    )  # хранится в UTC (naive)
+    )
 
     category: Mapped["IncomeCategory"] = relationship(back_populates="records")
 
@@ -146,9 +160,24 @@ class ExpenseRecord(Base):
     comment: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
-    )  # хранится в UTC (naive)
+    )
 
     category: Mapped["ExpenseCategory"] = relationship(back_populates="records")
+
+
+class Debt(Base):
+    __tablename__ = "debts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    direction: Mapped[str] = mapped_column(String(8))  # "owe" — я должен, "lent" — мне должны
+    counterparty: Mapped[str] = mapped_column(String(128))
+    amount: Mapped[float] = mapped_column(Float)
+    comment: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
 
 engine = create_async_engine(DB_URL, echo=False)
@@ -163,23 +192,22 @@ class AddFlow(StatesGroup):
     comment = State()
 
 
+class CategoryFlow(StatesGroup):
+    name = State()
+
+
+class DebtFlow(StatesGroup):
+    counterparty = State()
+    amount = State()
+    comment = State()
+
+
 # --------------------------------------------------------------------------- #
 # Инициализация БД
 # --------------------------------------------------------------------------- #
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-
-    async with async_session() as session:
-        # Дефолтные категории доходов
-        existing_income = (await session.execute(select(IncomeCategory))).scalars().all()
-        if not existing_income:
-            session.add_all([IncomeCategory(name=n) for n in DEFAULT_INCOME_CATEGORIES])
-        # Дефолтные категории расходов
-        existing_expense = (await session.execute(select(ExpenseCategory))).scalars().all()
-        if not existing_expense:
-            session.add_all([ExpenseCategory(name=n) for n in DEFAULT_EXPENSE_CATEGORIES])
-        await session.commit()
     logger.info("База данных инициализирована")
 
 
@@ -188,6 +216,10 @@ async def get_or_create_user(session: AsyncSession, user_id: int) -> User:
     if user is None:
         user = User(id=user_id, timezone=DEFAULT_TZ)
         session.add(user)
+        await session.flush()
+        # сеем дефолтные категории для нового пользователя
+        session.add_all([IncomeCategory(user_id=user_id, name=n) for n in DEFAULT_INCOME_CATEGORIES])
+        session.add_all([ExpenseCategory(user_id=user_id, name=n) for n in DEFAULT_EXPENSE_CATEGORIES])
         await session.commit()
         logger.info("Создан новый пользователь: %s", user_id)
     return user
@@ -204,7 +236,6 @@ def get_user_tz(user: User) -> ZoneInfo:
 
 
 def month_start_utc(user: User) -> datetime:
-    """Начало текущего месяца в таймзоне пользователя, приведённое к naive UTC."""
     tz = get_user_tz(user)
     now_local = datetime.now(tz)
     start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -236,6 +267,15 @@ async def month_totals(session: AsyncSession, user: User) -> tuple[float, float]
     return float(income), float(expense)
 
 
+async def get_categories(session: AsyncSession, user_id: int, kind: str):
+    model = IncomeCategory if kind == "income" else ExpenseCategory
+    return (
+        await session.execute(
+            select(model).where(model.user_id == user_id).order_by(model.id)
+        )
+    ).scalars().all()
+
+
 # --------------------------------------------------------------------------- #
 # Единое актуальное сообщение
 # --------------------------------------------------------------------------- #
@@ -246,8 +286,6 @@ async def send_or_edit(
     text: str,
     keyboard: InlineKeyboardMarkup,
 ) -> None:
-    """Держим в чате одно актуальное сообщение: сначала пробуем редактировать,
-    если нельзя — удаляем старое и отправляем новое."""
     chat_id = user.id
     if user.last_bot_message_id:
         try:
@@ -280,12 +318,18 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="➖ Расход", callback_data="add:expense"),
             ],
             [InlineKeyboardButton(text="📊 Статистика за месяц", callback_data="stats")],
+            [
+                InlineKeyboardButton(text="🗂 Категории доходов", callback_data="cats:income"),
+                InlineKeyboardButton(text="🗂 Категории расходов", callback_data="cats:expense"),
+            ],
+            [InlineKeyboardButton(text="💳 Долги", callback_data="debts")],
             [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")],
         ]
     )
 
 
 def categories_kb(kind: str, categories) -> InlineKeyboardMarkup:
+    """Клавиатура выбора категории при добавлении дохода/расхода."""
     rows = []
     row = []
     for cat in categories:
@@ -301,17 +345,62 @@ def categories_kb(kind: str, categories) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def cancel_kb() -> InlineKeyboardMarkup:
+def category_manage_kb(kind: str, categories) -> InlineKeyboardMarkup:
+    """Клавиатура управления категориями (добавить / удалить)."""
+    rows = []
+    for cat in categories:
+        rows.append(
+            [
+                InlineKeyboardButton(text=cat.name, callback_data="noop"),
+                InlineKeyboardButton(text="🗑", callback_data=f"catdel:{kind}:{cat.id}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Добавить категорию", callback_data=f"catadd:{kind}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def debts_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data="menu:main")]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📕 Я должен", callback_data="debt_add:owe"),
+                InlineKeyboardButton(text="📗 Мне должны", callback_data="debt_add:lent"),
+            ],
+            [InlineKeyboardButton(text="📋 Список долгов", callback_data="debt_list")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu:main")],
+        ]
     )
 
 
-def comment_kb() -> InlineKeyboardMarkup:
+def debt_list_kb(debts) -> InlineKeyboardMarkup:
+    rows = []
+    for d in debts:
+        icon = "📕" if d.direction == "owe" else "📗"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{icon} {d.counterparty}: {fmt_money(d.amount)}",
+                    callback_data="noop",
+                ),
+                InlineKeyboardButton(text="✅ Закрыть", callback_data=f"debt_close:{d.id}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="debts")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cancel_kb(back: str = "menu:main") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✖️ Отмена", callback_data=back)]]
+    )
+
+
+def comment_kb(skip_cb: str, back: str = "menu:main") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏭ Пропустить", callback_data="skip_comment")],
-            [InlineKeyboardButton(text="✖️ Отмена", callback_data="menu:main")],
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data=skip_cb)],
+            [InlineKeyboardButton(text="✖️ Отмена", callback_data=back)],
         ]
     )
 
@@ -394,251 +483,4 @@ async def build_stats_text(session: AsyncSession, user: User) -> str:
         lines.append("  — нет записей")
     lines.append(f"  <b>Итого: {fmt_money(float(income_total))}</b>\n")
 
-    lines.append("<b>📉 Расходы:</b>")
-    if expense_rows:
-        for name, value in expense_rows:
-            lines.append(f"  • {name}: {fmt_money(float(value))}")
-    else:
-        lines.append("  — нет записей")
-    lines.append(f"  <b>Итого: {fmt_money(float(expense_total))}</b>\n")
-
-    lines.append(f"🧮 <b>Баланс: {fmt_money(float(income_total - expense_total))}</b>")
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------- #
-# Хэндлеры
-# --------------------------------------------------------------------------- #
-dp = Dispatcher()
-
-
-@dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    async with async_session() as session:
-        user = await get_or_create_user(session, message.from_user.id)
-        # чистим сообщение пользователя
-        try:
-            await message.delete()
-        except TelegramBadRequest:
-            pass
-        text = await build_main_menu_text(session, user)
-        await send_or_edit(bot, session, user, text, main_menu_kb())
-
-
-@dp.callback_query(F.data == "menu:main")
-async def cb_main_menu(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        text = await build_main_menu_text(session, user)
-        await send_or_edit(bot, session, user, text, main_menu_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "stats")
-async def cb_stats(callback: CallbackQuery, bot: Bot) -> None:
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        text = await build_stats_text(session, user)
-        await send_or_edit(bot, session, user, text, back_kb())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "settings")
-async def cb_settings(callback: CallbackQuery, bot: Bot) -> None:
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        text = (
-            "<b>⚙️ Настройки</b>\n\n"
-            f"Текущая таймзона: <code>{user.timezone}</code>\n\n"
-            "Выберите таймзону из списка:"
-        )
-        await send_or_edit(bot, session, user, text, settings_kb(user.timezone))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("tz:"))
-async def cb_set_tz(callback: CallbackQuery, bot: Bot) -> None:
-    tz_name = callback.data.split(":", 1)[1]
-    if tz_name not in available_timezones():
-        await callback.answer("Неизвестная таймзона", show_alert=True)
-        return
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        user.timezone = tz_name
-        await session.commit()
-        text = (
-            "<b>⚙️ Настройки</b>\n\n"
-            f"Таймзона обновлена: <code>{user.timezone}</code>\n\n"
-            "Выберите таймзону из списка:"
-        )
-        await send_or_edit(bot, session, user, text, settings_kb(user.timezone))
-    await callback.answer("Таймзона сохранена ✅")
-
-
-@dp.callback_query(F.data.in_({"add:income", "add:expense"}))
-async def cb_add_start(callback: CallbackQuery, bot: Bot) -> None:
-    kind = callback.data.split(":", 1)[1]  # income / expense
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        if kind == "income":
-            cats = (await session.execute(select(IncomeCategory).order_by(IncomeCategory.id))).scalars().all()
-            title = "➕ Добавление дохода"
-        else:
-            cats = (await session.execute(select(ExpenseCategory).order_by(ExpenseCategory.id))).scalars().all()
-            title = "➖ Добавление расхода"
-        text = f"<b>{title}</b>\n\nВыберите категорию:"
-        await send_or_edit(bot, session, user, text, categories_kb(kind, cats))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("cat:"))
-async def cb_choose_category(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    _, kind, cat_id = callback.data.split(":")
-    cat_id = int(cat_id)
-
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        if kind == "income":
-            cat = await session.get(IncomeCategory, cat_id)
-        else:
-            cat = await session.get(ExpenseCategory, cat_id)
-        if cat is None:
-            await callback.answer("Категория не найдена", show_alert=True)
-            return
-
-        await state.update_data(kind=kind, category_id=cat_id, category_name=cat.name)
-        await state.set_state(AddFlow.amount)
-
-        title = "➕ Доход" if kind == "income" else "➖ Расход"
-        text = (
-            f"<b>{title}</b>\n"
-            f"Категория: <b>{cat.name}</b>\n\n"
-            "Введите сумму (например: <code>1500</code> или <code>99.90</code>):"
-        )
-        await send_or_edit(bot, session, user, text, cancel_kb())
-    await callback.answer()
-
-
-@dp.message(AddFlow.amount)
-async def process_amount(message: Message, state: FSMContext, bot: Bot) -> None:
-    raw = (message.text or "").strip().replace(",", ".").replace(" ", "")
-    try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-
-    async with async_session() as session:
-        user = await get_or_create_user(session, message.from_user.id)
-        try:
-            amount = float(raw)
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            data = await state.get_data()
-            title = "➕ Доход" if data["kind"] == "income" else "➖ Расход"
-            text = (
-                f"<b>{title}</b>\n"
-                f"Категория: <b>{data['category_name']}</b>\n\n"
-                "⚠️ Некорректная сумма. Введите положительное число, "
-                "например <code>1500</code> или <code>99.90</code>:"
-            )
-            await send_or_edit(bot, session, user, text, cancel_kb())
-            return
-
-        await state.update_data(amount=amount)
-        await state.set_state(AddFlow.comment)
-
-        data = await state.get_data()
-        title = "➕ Доход" if data["kind"] == "income" else "➖ Расход"
-        text = (
-            f"<b>{title}</b>\n"
-            f"Категория: <b>{data['category_name']}</b>\n"
-            f"Сумма: <b>{fmt_money(amount)}</b>\n\n"
-            "Добавьте комментарий или нажмите «Пропустить»:"
-        )
-        await send_or_edit(bot, session, user, text, comment_kb())
-
-
-async def _save_record(session: AsyncSession, user: User, data: dict, comment: str | None) -> None:
-    if data["kind"] == "income":
-        record = IncomeRecord(
-            user_id=user.id,
-            category_id=data["category_id"],
-            amount=data["amount"],
-            comment=comment,
-        )
-    else:
-        record = ExpenseRecord(
-            user_id=user.id,
-            category_id=data["category_id"],
-            amount=data["amount"],
-            comment=comment,
-        )
-    session.add(record)
-    await session.commit()
-
-
-@dp.message(AddFlow.comment)
-async def process_comment(message: Message, state: FSMContext, bot: Bot) -> None:
-    comment = (message.text or "").strip() or None
-    try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-
-    async with async_session() as session:
-        user = await get_or_create_user(session, message.from_user.id)
-        data = await state.get_data()
-        await _save_record(session, user, data, comment)
-        await state.clear()
-        text = await build_main_menu_text(session, user)
-        await send_or_edit(bot, session, user, "✅ Запись сохранена!\n\n" + text, main_menu_kb())
-
-
-@dp.callback_query(AddFlow.comment, F.data == "skip_comment")
-async def cb_skip_comment(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    async with async_session() as session:
-        user = await get_or_create_user(session, callback.from_user.id)
-        data = await state.get_data()
-        await _save_record(session, user, data, None)
-        await state.clear()
-        text = await build_main_menu_text(session, user)
-        await send_or_edit(bot, session, user, "✅ Запись сохранена!\n\n" + text, main_menu_kb())
-    await callback.answer("Сохранено ✅")
-
-
-@dp.message()
-async def fallback_message(message: Message, bot: Bot) -> None:
-    """Любое сообщение вне сценария — показываем главное меню и чистим ввод."""
-    try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-    async with async_session() as session:
-        user = await get_or_create_user(session, message.from_user.id)
-        text = await build_main_menu_text(session, user)
-        await send_or_edit(bot, session, user, text, main_menu_kb())
-
-
-# --------------------------------------------------------------------------- #
-# Запуск
-# --------------------------------------------------------------------------- #
-async def main() -> None:
-    await init_db()
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    logger.info("Бот запускается (long polling)...")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        await engine.dispose()
-        logger.info("Бот остановлен")
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Выход по сигналу пользователя")
+    lines.append("<b>📉 Расход
