@@ -12,23 +12,18 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
-# ===========================================================================
-# 1. КОНФИГУРАЦИЯ И НАСТРОЙКИ
-# ===========================================================================
+# Категории доходов: Зарплата, Подарки, Подработка, Инвестиции
+# Категории расходов: Еда, Транспорт, Жилье, Развлечения, Здоровье
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден! Проверьте файл .env")
+    raise ValueError("BOT_TOKEN не найден")
 
 DB_PATH = "finance.db"
 DEFAULT_TIMEZONE = "Europe/Moscow"
@@ -44,13 +39,9 @@ DEFAULT_EXPENSE_CATEGORIES = ["Еда", "Транспорт", "Жилье", "Р�
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
 logger = logging.getLogger(__name__)
 
-# ===========================================================================
-# 2. FSM СОСТОЯНИЯ
-# ===========================================================================
 class TransactionStates(StatesGroup):
     choosing_category = State()
     entering_amount = State()
-    entering_comment = State()
 
 class CategoryStates(StatesGroup):
     adding_category = State()
@@ -58,14 +49,10 @@ class CategoryStates(StatesGroup):
 class DebtStates(StatesGroup):
     entering_person = State()
     entering_amount = State()
-    entering_comment = State()
 
 class SettingsStates(StatesGroup):
     entering_timezone = State()
 
-# ===========================================================================
-# 3. БАЗА ДАННЫХ
-# ===========================================================================
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -91,7 +78,6 @@ async def init_db():
                 type TEXT NOT NULL CHECK(type IN ('income','expense')),
                 category_id INTEGER,
                 amount REAL NOT NULL,
-                comment TEXT,
                 created_at TEXT NOT NULL
             )
         """)
@@ -102,7 +88,6 @@ async def init_db():
                 operation_type TEXT NOT NULL,
                 person_name TEXT NOT NULL,
                 amount REAL NOT NULL,
-                comment TEXT,
                 created_at TEXT NOT NULL
             )
         """)
@@ -159,12 +144,12 @@ async def db_delete_category(cat_id: int, user_id: int):
         await db.execute("DELETE FROM categories WHERE id=? AND user_id=?", (cat_id, user_id))
         await db.commit()
 
-async def db_add_transaction(user_id: int, ttype: str, cat_id: int, amount: float, comment: str):
+async def db_add_transaction(user_id: int, ttype: str, cat_id: int, amount: float):
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO transactions (user_id,type,category_id,amount,comment,created_at) VALUES (?,?,?,?,?,?)",
-            (user_id, ttype, cat_id, amount, comment, now)
+            "INSERT INTO transactions (user_id,type,category_id,amount,created_at) VALUES (?,?,?,?,?)",
+            (user_id, ttype, cat_id, amount, now)
         )
         await db.commit()
 
@@ -189,12 +174,12 @@ async def db_get_top_categories(user_id: int, ttype: str, start: datetime, end: 
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
-async def db_add_debt(user_id: int, op_type: str, person: str, amount: float, comment: str):
+async def db_add_debt(user_id: int, op_type: str, person: str, amount: float):
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO debts (user_id,operation_type,person_name,amount,comment,created_at) VALUES (?,?,?,?,?,?)",
-            (user_id, op_type, person, amount, comment, now)
+            "INSERT INTO debts (user_id,operation_type,person_name,amount,created_at) VALUES (?,?,?,?,?)",
+            (user_id, op_type, person, amount, now)
         )
         await db.commit()
 
@@ -226,9 +211,6 @@ async def db_get_debt_history(user_id: int, limit: int = 10) -> list[dict]:
         async with db.execute("SELECT * FROM debts WHERE user_id=? ORDER BY created_at DESC LIMIT ?", (user_id, limit)) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
-# ===========================================================================
-# 4. УТИЛИТЫ
-# ===========================================================================
 def parse_amount(text: str) -> float | None:
     try:
         val = float(text.strip().replace(",", ".").replace(" ", ""))
@@ -276,18 +258,26 @@ async def safe_delete(bot: Bot, chat_id: int, message_id: int | None):
     if not message_id: return
     try: await bot.delete_message(chat_id, message_id)
     except TelegramBadRequest: pass
-    except Exception as e: logger.debug(f"Delete error: {e}")
+    except Exception: pass
 
 async def send_new_screen(bot: Bot, user_id: int, chat_id: int, text: str, markup: InlineKeyboardMarkup):
-    """Удаляет старое сообщение и отправляет новое (принцип одного сообщения)"""
     user = await db_get_or_create_user(user_id)
-    await safe_delete(bot, chat_id, user.get("last_bot_message_id"))
+    last_id = user.get("last_bot_message_id")
+    
+    if last_id:
+        try:
+            await bot.edit_message_text(text=text, chat_id=chat_id, message_id=last_id, reply_markup=markup, parse_mode="HTML")
+            return
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return
+        except Exception:
+            pass
+            
+    await safe_delete(bot, chat_id, last_id)
     msg = await bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
     await db_save_last_message(user_id, msg.message_id)
 
-# ===========================================================================
-# 5. КЛАВИАТУРЫ
-# ===========================================================================
 def kb_main_menu():
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="💰 Доход", callback_data="add_income"), InlineKeyboardButton(text="💸 Расход", callback_data="add_expense"))
@@ -317,12 +307,6 @@ def kb_cats_manage(categories, cat_type):
     b.row(InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu"))
     return b.as_markup()
 
-def kb_comment():
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text="⏭ Без комментария", callback_data="no_comment"))
-    b.row(InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu"))
-    return b.as_markup()
-
 def kb_debts():
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="📥 Я взял", callback_data="debtop:i_borrowed"), InlineKeyboardButton(text="📤 Я вернул", callback_data="debtop:i_returned"))
@@ -344,15 +328,12 @@ def kb_tz():
     b.row(InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu"))
     return b.as_markup()
 
-# ===========================================================================
-# 6. РОУТЕР И ХЕНДЛЕРЫ
-# ===========================================================================
 router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(msg: Message, bot: Bot, state: FSMContext):
     await state.clear()
-    await safe_delete(bot, msg.chat.id, msg.message_id) # Удаляем сообщение пользователя
+    await safe_delete(bot, msg.chat.id, msg.message_id)
     await show_main_menu(msg.from_user.id, msg.chat.id, bot)
 
 @router.callback_query(F.data == "main_menu")
@@ -375,7 +356,6 @@ async def show_main_menu(user_id: int, chat_id: int, bot: Bot):
             f"💰 Доходы: <b>{fmt_amount(inc)}</b>\n💸 Расходы: <b>{fmt_amount(exp)}</b>\n📊 Баланс: <b>{fmt_amount(bal)}</b>\n\nВыберите действие:")
     await send_new_screen(bot, user_id, chat_id, text, kb_main_menu())
 
-# --- ТРАНЗАКЦИИ ---
 @router.callback_query(F.data.in_({"add_income", "add_expense"}))
 async def cb_add_trans(call: CallbackQuery, bot: Bot, state: FSMContext):
     ttype = "income" if call.data == "add_income" else "expense"
@@ -407,31 +387,15 @@ async def msg_amount(msg: Message, bot: Bot, state: FSMContext):
     if not amount:
         await send_new_screen(bot, msg.from_user.id, msg.chat.id, "❌ Некорректная сумма. Попробуйте еще раз (например, 1000):", kb_cancel())
         return
-    await state.update_data(amount=amount)
-    await send_new_screen(bot, msg.from_user.id, msg.chat.id, f"Сумма: {fmt_amount(amount)}\nВведите комментарий или нажмите кнопку:", kb_comment())
-    await state.set_state(TransactionStates.entering_comment)
-
-@router.message(TransactionStates.entering_comment)
-async def msg_comment(msg: Message, bot: Bot, state: FSMContext):
-    await safe_delete(bot, msg.chat.id, msg.message_id)
-    await finish_transaction(msg.from_user.id, msg.chat.id, bot, state, msg.text)
-
-@router.callback_query(TransactionStates.entering_comment, F.data == "no_comment")
-async def cb_no_comment(call: CallbackQuery, bot: Bot, state: FSMContext):
-    await finish_transaction(call.from_user.id, call.message.chat.id, bot, state, "")
-    await call.answer()
-
-async def finish_transaction(user_id: int, chat_id: int, bot: Bot, state: FSMContext, comment: str):
     data = await state.get_data()
-    await db_add_transaction(user_id, data["ttype"], data["cat_id"], data["amount"], comment)
+    await db_add_transaction(msg.from_user.id, data["ttype"], data["cat_id"], amount)
     await state.clear()
-    await show_main_menu(user_id, chat_id, bot)
+    await show_main_menu(msg.from_user.id, msg.chat.id, bot)
 
-# --- УПРАВЛЕНИЕ КАТЕГОРИЯМИ ---
 @router.callback_query(F.data.in_({"cats_income", "cats_expense"}))
 async def cb_cats_manage(call: CallbackQuery, bot: Bot):
     ttype = "income" if call.data == "cats_income" else "expense"
-    cats = await db_get_categories(call.fromuser.id if hasattr(call, 'from_user') else call.from_user.id, ttype)
+    cats = await db_get_categories(call.from_user.id, ttype)
     lbl = "доходов" if ttype == "income" else "расходов"
     await send_new_screen(bot, call.from_user.id, call.message.chat.id, f"📂 Ваши категории {lbl}:", kb_cats_manage(cats, ttype))
     await call.answer()
@@ -459,9 +423,7 @@ async def msg_add_cat(msg: Message, bot: Bot, state: FSMContext):
     ttype = data.get("ttype", "expense")
     await db_add_category(msg.from_user.id, ttype, name)
     
-    # Если мы пришли из процесса ввода транзакции, возвращаемся туда
     if await state.get_state() == CategoryStates.adding_category.state and "cat_id" not in data and "amount" not in data:
-         # Возвращаем пользователя к выбору категорий
          cats = await db_get_categories(msg.from_user.id, ttype)
          lbl = "дохода" if ttype == "income" else "расхода"
          await send_new_screen(bot, msg.from_user.id, msg.chat.id, f"Выберите категорию {lbl}:", kb_cats_select(cats, "selcat"))
@@ -470,7 +432,6 @@ async def msg_add_cat(msg: Message, bot: Bot, state: FSMContext):
          await state.clear()
          await show_main_menu(msg.from_user.id, msg.chat.id, bot)
 
-# --- ДОЛГИ ---
 @router.callback_query(F.data == "debts_menu")
 async def cb_debts(call: CallbackQuery, bot: Bot):
     await send_new_screen(bot, call.from_user.id, call.message.chat.id, "🤝 Раздел долгов. Выберите действие:", kb_debts())
@@ -498,26 +459,10 @@ async def msg_debt_amount(msg: Message, bot: Bot, state: FSMContext):
     if not amount:
         await send_new_screen(bot, msg.from_user.id, msg.chat.id, "❌ Ошибка. Введите сумму цифрами:", kb_cancel())
         return
-    await state.update_data(amount=amount)
-    await send_new_screen(bot, msg.from_user.id, msg.chat.id, "Введите комментарий или пропустите:", kb_comment())
-    await state.set_state(DebtStates.entering_comment)
-
-@router.message(DebtStates.entering_comment)
-async def msg_debt_comment(msg: Message, bot: Bot, state: FSMContext):
-    await safe_delete(bot, msg.chat.id, msg.message_id)
-    await finish_debt(msg.from_user.id, msg.chat.id, bot, state, msg.text)
-
-@router.callback_query(DebtStates.entering_comment, F.data == "no_comment")
-async def cb_debt_nocomment(call: CallbackQuery, bot: Bot, state: FSMContext):
-    await finish_debt(call.from_user.id, call.message.chat.id, bot, state, "")
-    await call.answer()
-
-async def finish_debt(user_id: int, chat_id: int, bot: Bot, state: FSMContext, comment: str):
     d = await state.get_data()
-    await db_add_debt(user_id, d["op"], d["person"], d["amount"], comment)
+    await db_add_debt(msg.from_user.id, d["op"], d["person"], amount)
     await state.clear()
-    await cb_debts(CallbackQuery(id="", from_user=Message(message_id=0, date=datetime.now(), chat=Message(id=chat_id, type="private")).from_user, chat_instance="", message=Message(message_id=0, date=datetime.now(), chat=Message(id=chat_id, type="private"))), bot) # Хак для возврата в меню долгов, лучше просто вызвать функцию
-    await send_new_screen(bot, user_id, chat_id, "✅ Запись о долге сохранена.\nВыберите действие:", kb_debts())
+    await send_new_screen(bot, msg.from_user.id, msg.chat.id, "✅ Запись о долге сохранена.\nВыберите действие:", kb_debts())
 
 @router.callback_query(F.data == "debt_sum")
 async def cb_debt_sum(call: CallbackQuery, bot: Bot):
@@ -548,7 +493,6 @@ async def cb_debt_hist(call: CallbackQuery, bot: Bot):
     await send_new_screen(bot, call.from_user.id, call.message.chat.id, text, kb_back())
     await call.answer()
 
-# --- СТАТИСТИКА ---
 @router.callback_query(F.data == "stats_detail")
 async def cb_stats_menu(call: CallbackQuery, bot: Bot):
     await send_new_screen(bot, call.from_user.id, call.message.chat.id, "📊 Выберите период для статистики:", kb_stats())
@@ -589,7 +533,6 @@ async def cb_stats_show(call: CallbackQuery, bot: Bot):
     await send_new_screen(bot, call.from_user.id, call.message.chat.id, text, kb_back())
     await call.answer()
 
-# --- НАСТРОЙКИ ---
 @router.callback_query(F.data == "settings_menu")
 async def cb_settings(call: CallbackQuery, bot: Bot):
     user = await db_get_or_create_user(call.from_user.id)
@@ -620,22 +563,14 @@ async def msg_set_tz(msg: Message, bot: Bot, state: FSMContext):
     except (ZoneInfoNotFoundError, KeyError):
         await send_new_screen(bot, msg.from_user.id, msg.chat.id, "❌ Неверный формат. Введите часовой пояс (например, Europe/Moscow):", kb_cancel())
 
-
-# ===========================================================================
-# 7. ЗАПУСК БОТА
-# ===========================================================================
 async def main():
     await init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    
-    logger.info("Бот запущен. Ожидание обновлений...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
+    try: asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit): pass
